@@ -1316,7 +1316,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     .store(!minwork || ibd, Ordering::SeqCst);
                 let want_relay = !config.mempool.blocksonly && minwork && !ibd;
                 if want_relay != mempool.relay_enabled() {
-                    mempool_blocking(&mempool, move |mp| mp.set_relay_enabled(want_relay)).await?;
+                    let backfill = mempool_blocking(&mempool, move |mp| {
+                        mp.set_relay_enabled(want_relay);
+                        want_relay && mp.take_fee_backfill_due()
+                    })
+                    .await?;
                     node.peers
                         .queue_feefilter_all(node.hub.feefilter_sat_kvb() as i64);
                     if want_relay {
@@ -1324,11 +1328,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     } else {
                         info!("ibd: entering IBD — pausing tx relay");
                     }
-                }
-                if want_relay
-                    && mempool_blocking(&mempool, MempoolHub::take_fee_backfill_due).await?
-                {
-                    spawn_fee_history_backfill(&mempool);
+                    if backfill {
+                        spawn_fee_history_backfill(&mempool);
+                    }
                 }
             }
             if matches!(wake, TipFollowWake::Stop) {
