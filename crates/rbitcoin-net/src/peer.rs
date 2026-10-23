@@ -4159,7 +4159,6 @@ pub async fn on_headers(
     session: Option<&crate::peers::LivePeer>,
     headers: &[bitcoin::block::Header],
 ) -> Result<(), NetError> {
-    hub.note_headers_reply();
     let _ = session.is_some_and(|s| s.take_awaiting_headers());
     let noban = session.is_some_and(|s| s.session_noban());
     let pending = follow.pending_headers.clone();
@@ -4170,7 +4169,11 @@ pub async fn on_headers(
         classify_headers(hub, &headers, &pending, &requested, &have_bodies, noban)
     })
     .await?;
-    apply_headers(apply, hub, out_tx, follow, session)
+    apply_headers(apply, hub, out_tx, follow, session)?;
+    // Counting this before apply let the wallet bind finish the round
+    // while the batch was still in flight and Electrum served the old tip.
+    hub.note_headers_reply();
+    Ok(())
 }
 
 pub async fn on_block(
