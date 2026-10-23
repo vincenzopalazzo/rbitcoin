@@ -77,6 +77,9 @@ thread_local! {
     /// `None` means no walk is active.
     static PROMOTE_NOTES: std::cell::RefCell<Option<Vec<Txid>>> =
         const { std::cell::RefCell::new(None) };
+    /// Set by the maintenance-publish test. Fired while `template_prev` is held.
+    static MAINT_PUBLISH_HOOK: std::cell::Cell<Option<fn(&MempoolHub)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Record `txid` when a walk is already running. Returns false when this
@@ -1445,8 +1448,10 @@ impl MempoolHub {
     /// not enable peer relay or fee-history preload. A second call does nothing.
     ///
     /// Returns false when the purge hits a store fault. The flag stays clear
-    /// so the next successful call retries. Takes `template_prev` before the
-    /// flag is visible. Callers that hold [`TemplateHold`] must drop it first.
+    /// so the next successful call retries. The leaving tip's fee sample and
+    /// the flag are stored before `template_prev` is released, so a connect
+    /// waiting on that lock strips instead of skipping the block. Callers
+    /// that hold [`TemplateHold`] must drop it first.
     pub fn begin_pool_maintenance(&self) -> bool {
         if self.pool_maintained.load(Ordering::Acquire) {
             return true;
@@ -1481,17 +1486,36 @@ impl MempoolHub {
         } else {
             (false, None)
         };
-        drop(slot);
+        // Publish before the unlock. `connect_at` reads the flag only after
+        // it takes this mutex. Fee-history insert drops every newer height,
+        // so this sample has to land before the next connect records one.
         if marked {
             self.note_template_update();
         }
-        // The connect that leaves IBD strips before this flag exists, so
-        // that block would otherwise stay out of fee history until preload.
         if let Some(h) = tip_height {
             self.note_block_fee_history(h);
         }
         self.pool_maintained.store(true, Ordering::Release);
+        self.fire_maint_publish_hook();
+        drop(slot);
         true
+    }
+
+    /// Observe maintenance publish. The hook runs on this thread.
+    #[doc(hidden)]
+    pub fn set_maint_publish_hook(hook: fn(&MempoolHub)) {
+        MAINT_PUBLISH_HOOK.with(|slot| slot.set(Some(hook)));
+    }
+
+    fn fire_maint_publish_hook(&self) {
+        let hook = MAINT_PUBLISH_HOOK.with(|slot| slot.take());
+        if let Some(hook) = hook {
+            assert!(
+                self.template_prev.try_lock().is_err(),
+                "maintenance published after the template lock was released"
+            );
+            hook(self);
+        }
     }
 
     /// One-shot: relay just turned on and fee history has not been preloaded.
@@ -3282,7 +3306,7 @@ impl MempoolHub {
     /// The live set is unchanged. RPC `generate` commits them once that block
     /// is accepted, before a later block of the same call is mined. Catch-up
     /// must not call this (that block stays coinbase-only).
-    /// [`Self::remove_for_block`] drops nothing while relay is off.
+    /// [`Self::remove_for_block`] drops nothing until maintenance has begun.
     pub fn select_generate_txs(&self, min_sat_kvb: u64) -> Vec<Transaction> {
         let deltas = self.fee_deltas.lock().unwrap().clone();
         let g = self.lock_write();

@@ -1813,6 +1813,32 @@ fn maintenance_flag_stays_clear_until_the_purge_lock() {
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
+/// A connect waiting on `template_prev` must see maintenance and the leaving
+/// tip's fee sample. Both are stored before that lock is released.
+fn on_maint_publish(mp: &MempoolHub) {
+    assert!(
+        mp.pool_maintained(),
+        "maintenance flag was still clear inside the template lock"
+    );
+    let height = mp.query.tip_height().expect("tip").0;
+    assert!(
+        mp.block_p10_history.lock().unwrap().get(height).is_some(),
+        "leaving tip was not in fee history inside the template lock"
+    );
+}
+
+#[test]
+fn maintenance_is_published_before_the_template_lock_releases() {
+    let (store, q, _cbs) = copy_maturity_pad(3);
+    let dir = tmp();
+    let mp = MempoolHub::open(&dir, q).unwrap();
+    MempoolHub::set_maint_publish_hook(on_maint_publish);
+    assert!(mp.begin_pool_maintenance());
+    assert!(mp.pool_maintained());
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store);
+}
+
 /// Before maintenance begins, per-block remove is deferred. Enabling relay
 /// starts maintenance and runs the purge.
 #[test]
