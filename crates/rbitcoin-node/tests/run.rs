@@ -979,3 +979,51 @@ async fn proxy_seed_wait_ends_on_a_learned_reply_shutdown_or_deadline() {
     .await;
     assert!(book.is_none(), "shutdown ends the wait with no book");
 }
+
+/// A live follow peer that has not sent getheaders must not release the
+/// wallet bind. Shutdown still does.
+#[tokio::test]
+async fn wallet_history_stays_down_until_getheaders_or_shutdown() {
+    use std::sync::atomic::Ordering;
+
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_net::{P2PNode, REDIAL_INTERVAL_TEST};
+
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-wallet-history-{n}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let query = Query::open_or_create_tiny(dir.join("store")).unwrap();
+    let node = P2PNode::start(
+        "127.0.0.1:0".parse().unwrap(),
+        query,
+        ChainParams::regtest(),
+        Milestone::NONE,
+        REDIAL_INTERVAL_TEST,
+    )
+    .await
+    .expect("listen");
+    node.follow_live.fetch_add(1, Ordering::SeqCst);
+    let shutdown = Shutdown::new();
+    let pending = {
+        let mut wait = std::pin::pin!(wait_wallet_history(&node, true, &shutdown, (0, 0)));
+        let pending = tokio::select! {
+            _ = &mut wait => false,
+            _ = tokio::time::sleep(Duration::from_millis(2_500)) => true,
+        };
+        shutdown.request();
+        tokio::time::timeout(Duration::from_secs(2), &mut wait)
+            .await
+            .expect("shutdown releases the wallet-history wait");
+        pending
+    };
+    node.follow_live.fetch_sub(1, Ordering::SeqCst);
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        pending,
+        "wallet history returned before getheaders was sent"
+    );
+}

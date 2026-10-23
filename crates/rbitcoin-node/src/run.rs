@@ -2240,7 +2240,9 @@ pub async fn start_i2p_named_forward(
 ///
 /// Scripthash materialize holds the process before dial. The miner can add
 /// a block in that window. Opening Electrum on the pre-dial tip serves a
-/// history that does not include it.
+/// history that does not include it. A round that has not been sent yet is
+/// not that round: the wait runs until the send is answered and the
+/// scripthash head covers the tip, or until shutdown or 20 seconds.
 pub async fn wait_wallet_history(
     node: &P2PNode,
     shindex: bool,
@@ -2253,7 +2255,6 @@ pub async fn wait_wallet_history(
     let (sent0, reply0) = mark;
     let started = Instant::now();
     let deadline = Duration::from_secs(20);
-    let unsent_limit = Duration::from_secs(2);
     loop {
         if shutdown.requested() || started.elapsed() >= deadline {
             return;
@@ -2264,9 +2265,6 @@ pub async fn wait_wallet_history(
         let best = node.hub.best_header_height();
         let sh_ok = !shindex || node.hub.query.sh_is_tip_ready();
         if sent > 0 && replies >= sent && best <= tip && sh_ok {
-            return;
-        }
-        if sent == 0 && started.elapsed() >= unsent_limit {
             return;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
