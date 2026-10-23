@@ -2245,11 +2245,12 @@ async fn sync_tx_relay(
     if want == mempool.relay_enabled() {
         return Ok(());
     }
-    let backfill = mempool_blocking(mempool, move |mp| {
-        mp.set_relay_enabled(want);
-        want && mp.take_fee_backfill_due()
-    })
-    .await?;
+    let edge = mempool_blocking(mempool, move |mp| mp.apply_relay_edge(want)).await?;
+    // A purge fault leaves the bit unchanged. The next wake retries. Do not
+    // tell peers relay is on, or log that it flipped, until the store moved.
+    let Some(backfill) = edge else {
+        return Ok(());
+    };
     node.peers
         .queue_feefilter_all(node.hub.feefilter_sat_kvb() as i64);
     if want {
@@ -2267,9 +2268,10 @@ async fn sync_tx_relay(
 ///
 /// Scripthash materialize holds the process before dial. The miner can add
 /// a block in that window. Opening Electrum on the pre-dial tip serves a
-/// history that does not include it. The same wait used to leave tx relay
-/// off, so the block a peer delivered then was not selected for BIP152
-/// high-bandwidth. Relay follows IBD on each tick of this wait.
+/// history that does not include it. Relay follows IBD on each tick of this
+/// wait, so a block accepted after that flip can be selected for
+/// high-bandwidth compact relay. An accept already on the lane sampled relay
+/// before connect and is not selected by this tick.
 pub async fn wait_wallet_history(
     node: &P2PNode,
     config: &NodeConfig,

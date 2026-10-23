@@ -1434,6 +1434,18 @@ impl MempoolHub {
         self.relay_enabled.store(on, Ordering::SeqCst);
     }
 
+    /// Move relay to `want`. `Some(backfill)` when the stored bit changed.
+    /// `None` when it did not, including a purge fault that leaves relay off.
+    /// The preload bit is taken only on a real off-to-on edge.
+    pub fn apply_relay_edge(&self, want: bool) -> Option<bool> {
+        let before = self.relay_enabled();
+        self.set_relay_enabled(want);
+        if self.relay_enabled() == before {
+            return None;
+        }
+        Some(want && self.take_fee_backfill_due())
+    }
+
     pub fn relay_enabled(&self) -> bool {
         self.relay_enabled.load(Ordering::SeqCst)
     }

@@ -1839,6 +1839,34 @@ fn maintenance_is_published_before_the_template_lock_releases() {
     let _ = std::fs::remove_dir_all(&store);
 }
 
+/// Callers queue a feefilter only when the stored relay bit changes. A second
+/// call, and a purge that does not publish, are not an edge.
+#[test]
+fn relay_edge_reports_a_change_only_when_the_bit_moves() {
+    let dir = tmp();
+    let store_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let mp = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+    assert_eq!(mp.apply_relay_edge(true), Some(true));
+    assert!(mp.relay_enabled());
+    assert!(mp.pool_maintained());
+    assert!(
+        !mp.take_fee_backfill_due(),
+        "the on edge consumes the preload bit"
+    );
+    assert_eq!(
+        mp.apply_relay_edge(true),
+        None,
+        "a second on is not an edge"
+    );
+    assert_eq!(mp.apply_relay_edge(false), Some(false));
+    assert!(!mp.relay_enabled());
+    assert!(mp.pool_maintained(), "pausing relay keeps pool maintenance");
+    assert_eq!(mp.apply_relay_edge(false), None);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
 /// Before maintenance begins, per-block remove is deferred. Enabling relay
 /// starts maintenance and runs the purge.
 #[test]
