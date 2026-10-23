@@ -151,7 +151,7 @@ async fn wait_ms_until(
 }
 
 async fn wait_v2_eof(sess: &mut rbitcoin_net::V2PlainSession, label: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(llvm_cov_ms(3_000));
     loop {
         match tokio::time::timeout(Duration::from_millis(100), sess.read_contents()).await {
             Ok(Err(_)) => return,
@@ -194,6 +194,16 @@ fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
         Duration::from_secs(llvm_secs)
     } else {
         Duration::from_secs(default_secs)
+    }
+}
+
+/// Real-time wait. Tripled under `coverage.sh`, where the same handshake
+/// often misses a 3s or 15s cap. The green path still returns on the first hit.
+fn llvm_cov_ms(ms: u64) -> u64 {
+    if std::env::var_os("CARGO_LLVM_COV").is_some() {
+        ms.saturating_mul(3)
+    } else {
+        ms
     }
 }
 
@@ -367,10 +377,13 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
 
         let mut peer = start_node(&peer_dir).await;
         let dummy = start_node(&dummy_dir).await;
-        tokio::time::timeout(Duration::from_secs(5), peer.follow_from(seed.local_addr))
-            .await
-            .expect("follow_from must return after handshake")
-            .expect("follow handshake");
+        tokio::time::timeout(
+            Duration::from_millis(llvm_cov_ms(5_000)),
+            peer.follow_from(seed.local_addr),
+        )
+        .await
+        .expect("follow_from must return after handshake")
+        .expect("follow handshake");
         assert!(
             peer.follow_live_count() >= 1,
             "outbound session must stay live after follow_from"
@@ -379,7 +392,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             .addconnection(dummy.local_addr, PeerConnType::OutboundFullRelay)
             .expect("preferred outbound for stall");
         wait_ms_until(
-            3_000,
+            llvm_cov_ms(3_000),
             || {
                 seed.peers.snapshot().into_iter().any(|p| {
                     !p.inbound
@@ -423,7 +436,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         );
 
         wait_ms_until(
-            3_000,
+            llvm_cov_ms(3_000),
             || {
                 peer.peers.live_peers().into_iter().any(|p| {
                     !p.inbound && p.handshake_complete() && p.queue_msg(NetworkMessage::GetAddr)
@@ -438,7 +451,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         )
         .await;
         wait_ms_until(
-            5_000,
+            llvm_cov_ms(5_000),
             || {
                 peer.peers.snapshot().into_iter().any(|p| {
                     !p.inbound && p.bytesrecv_per_msg.get("addrv2").copied().unwrap_or(0) > 0
@@ -474,9 +487,9 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         let now = seed.peers.now_secs();
         seed.peers.set_mock_now(now + 40 * 60);
         // The disconnect is requested on this call. Under llvm-cov the session
-        // task can take longer than a couple of seconds to leave the table.
+        // task can take longer than the uninstrumented 15s to leave the table.
         wait_ms_until(
-            15_000,
+            llvm_cov_ms(15_000),
             || {
                 !seed
                     .peers
@@ -520,7 +533,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             .await
             .expect("tcp to seed");
         raw.write_all(&magic).await.expect("write v1 magic");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(llvm_cov_ms(3_000));
         let mut saw_connecting = false;
         loop {
             let connecting = seed
@@ -637,7 +650,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         {
             peer.peers.disconnect_id(id);
         }
-        let drop_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let drop_deadline = tokio::time::Instant::now() + Duration::from_millis(llvm_cov_ms(2_000));
         loop {
             let follow_in = seed
                 .peers
@@ -658,7 +671,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         peer.peers
             .addconnection(seed.local_addr, PeerConnType::AddrFetch)
             .expect("addrfetch dial");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(llvm_cov_ms(5_000));
         loop {
             let seed_got_getaddr = seed
                 .peers
@@ -709,7 +722,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         let t = peer.peers.now_secs();
         peer.peers.set_mock_now(t + 301);
         wait_ms_until(
-            2_000,
+            llvm_cov_ms(2_000),
             || {
                 !peer
                     .peers
@@ -737,7 +750,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         peer.peers
             .addconnection(seed.local_addr, PeerConnType::AddrFetch)
             .expect("second addrfetch dial");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(llvm_cov_ms(3_000));
         let mut saw_fetch = false;
         loop {
             let fetching = peer
@@ -759,9 +772,10 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         peer.shutdown().await;
         dummy.shutdown().await;
     };
-    tokio::time::timeout(Duration::from_secs(20), fut)
-        .await
-        .expect("p2p_timeout_getaddr_and_keepalive_ping wall timeout (20s)");
+    let wall = llvm_cov_wall(20, 90);
+    tokio::time::timeout(wall, fut).await.unwrap_or_else(|_| {
+        panic!("p2p_timeout_getaddr_and_keepalive_ping wall timeout ({wall:?})")
+    });
 }
 
 /// Heights 0 and 1 are sealed; the tip is not. A seeder whose filters have
