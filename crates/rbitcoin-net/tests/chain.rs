@@ -1210,6 +1210,10 @@ fn fresh_tip_accept_maintains_pool_without_peer_relay() {
         !mp.take_fee_backfill_due(),
         "fee-history preload waits until peer relay turns on"
     );
+    assert!(
+        mp.block_p10_history.lock().unwrap().get(1).is_some(),
+        "the block that leaves IBD is in fee history before peer relay"
+    );
     // Coinbase at height 1 matures once the tip reaches 101. Those blocks
     // are still inside the pack, with relay off, and must strip.
     hub.generate_to_script(100, ScriptBuf::from_bytes(vec![0x51]), vec![])

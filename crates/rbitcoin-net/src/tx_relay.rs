@@ -1469,20 +1469,26 @@ impl MempoolHub {
                 "mempool: purged {n} leftover tx(s) at tip-mode entry (deferred during IBD)"
             );
         }
-        let marked = if let Some(h) = self.query.tip_height() {
-            if let Ok(Some((_, rec))) = self.query.header_at_height(h) {
+        let (marked, tip_height) = if let Some(h) = self.query.tip_height() {
+            let marked = if let Ok(Some((_, rec))) = self.query.header_at_height(h) {
                 let changed = *slot != Some(rec.hash);
                 *slot = Some(rec.hash);
                 changed
             } else {
                 false
-            }
+            };
+            (marked, Some(h))
         } else {
-            false
+            (false, None)
         };
         drop(slot);
         if marked {
             self.note_template_update();
+        }
+        // The connect that leaves IBD strips before this flag exists, so
+        // that block would otherwise stay out of fee history until preload.
+        if let Some(h) = tip_height {
+            self.note_block_fee_history(h);
         }
         self.pool_maintained.store(true, Ordering::Release);
         true
