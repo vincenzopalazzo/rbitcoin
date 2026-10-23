@@ -886,10 +886,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
     if tip_follow_ready && !shutdown.requested() {
-        let header_mark = (
-            node.hub.initial_getheaders_sent(),
-            node.hub.headers_reply_count(),
-        );
+        let header_mark = node.hub.initial_getheaders_sent();
         let follow_n = targets.len().min(max_out.min(3));
         if catch_up.dial_failed_all() {
             for peer in targets.iter().take(follow_n) {
@@ -934,8 +931,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         // without a live session, including ones past `follow_n`. Hostnames
         // were registered before catch-up (`set_connect_hosts`).
         node.peers.set_connect_addrs(config.listen.connect.clone());
-        // Materialize can outlast the miner. Do not publish Electrum until
-        // the follow `getheaders` round is connected and indexed.
+        // Hold the wallet bind until each post-dial initial getheaders
+        // has been applied and the scripthash head covers the tip.
         wait_wallet_history(&node, config.shindex, &shutdown, header_mark).await;
     }
 
@@ -2236,23 +2233,19 @@ pub async fn start_i2p_named_forward(
     Ok(sam)
 }
 
-/// Wallet bind waits out one follow `getheaders` round.
+/// Wallet bind waits out the follow `getheaders` rounds.
 ///
-/// Scripthash materialize holds the process before dial. The miner can add
-/// a block in that window. Opening Electrum on the pre-dial tip serves a
-/// history that does not include it. A round that has not been sent yet is
-/// not that round: the wait runs until the send is answered and the
-/// scripthash head covers the tip, or until shutdown or 20 seconds.
-pub async fn wait_wallet_history(
-    node: &P2PNode,
-    shindex: bool,
-    shutdown: &Shutdown,
-    mark: (u64, u64),
-) {
+/// `sent0` is the initial-getheaders count before the follow dials.
+/// Scripthash materialize holds the process before those dials, and the miner
+/// can add a block in that window. The wait ends when every initial
+/// `getheaders` sent after `sent0` has been applied, the header tip is not
+/// ahead of the block tip, and the scripthash head covers that tip. A headers
+/// message that is not one of those sends does not end it. Shutdown or 20
+/// seconds does.
+pub async fn wait_wallet_history(node: &P2PNode, shindex: bool, shutdown: &Shutdown, sent0: u64) {
     if node.follow_live_count() == 0 {
         return;
     }
-    let (sent0, reply0) = mark;
     let started = Instant::now();
     let deadline = Duration::from_secs(20);
     loop {
@@ -2260,11 +2253,11 @@ pub async fn wait_wallet_history(
             return;
         }
         let sent = node.hub.initial_getheaders_sent().saturating_sub(sent0);
-        let replies = node.hub.headers_reply_count().saturating_sub(reply0);
+        let open = node.hub.initial_getheaders_outstanding_after(sent0);
         let tip = node.tip_height().unwrap_or(0);
         let best = node.hub.best_header_height();
         let sh_ok = !shindex || node.hub.query.sh_is_tip_ready();
-        if sent > 0 && replies >= sent && best <= tip && sh_ok {
+        if sent > 0 && open == 0 && best <= tip && sh_ok {
             return;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;

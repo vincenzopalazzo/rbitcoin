@@ -334,6 +334,8 @@ pub struct LivePeer {
     pub headers_sync_timeout: AtomicU64,
     /// Waiting for a headers reply to our getheaders (no BIP130 cap).
     pub awaiting_headers: AtomicBool,
+    /// Id of the initial `getheaders` this session still owes, or `0`.
+    pub initial_getheaders_id: AtomicU64,
     /// Wtxids we INV'd to this peer. GetData for a live mempool tx is
     /// answered only if announced here or the tx is reorg-servable.
     pub announced_wtx: Mutex<CappedSet<Wtxid>>,
@@ -781,6 +783,15 @@ impl LivePeer {
 
     pub fn take_awaiting_headers(&self) -> bool {
         self.awaiting_headers.swap(false, Ordering::Relaxed)
+    }
+
+    pub fn arm_initial_getheaders(&self, id: u64) {
+        self.initial_getheaders_id.store(id, Ordering::Relaxed);
+    }
+
+    /// `0` when this session has no outstanding initial `getheaders`.
+    pub fn take_initial_getheaders_id(&self) -> u64 {
+        self.initial_getheaders_id.swap(0, Ordering::Relaxed)
     }
 
     pub fn note_announced_wtx(&self, wtxid: Wtxid) {
@@ -2470,6 +2481,7 @@ impl PeerHub {
             sync_started: AtomicBool::new(false),
             headers_sync_timeout: AtomicU64::new(0),
             awaiting_headers: AtomicBool::new(false),
+            initial_getheaders_id: AtomicU64::new(0),
             announced_wtx: Mutex::new(CappedSet::new()),
             taken_cmpct: Mutex::new(Vec::new()),
             last_inv_sequence: AtomicU64::new(1),

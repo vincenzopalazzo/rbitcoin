@@ -651,6 +651,8 @@ pub struct ChainHub {
     pub finished_ibd: AtomicBool,
     /// Initial `getheaders` queued by follow sessions since process start.
     pub initial_getheaders_sent: AtomicU64,
+    /// Ids from [`Self::note_initial_getheaders_sent`] whose reply is not applied yet.
+    pub outstanding_initial_getheaders: std::sync::Mutex<Vec<u64>>,
     /// `headers` messages applied since process start (including empty).
     pub headers_replies: AtomicU64,
     /// A follow-session block inv during IBD. The walk asks its header peer.
@@ -774,6 +776,7 @@ impl ChainHub {
             chain_work_prefix: RwLock::new(Vec::new()),
             finished_ibd: AtomicBool::new(false),
             initial_getheaders_sent: AtomicU64::new(0),
+            outstanding_initial_getheaders: std::sync::Mutex::new(Vec::new()),
             headers_replies: AtomicU64::new(0),
             header_inv_challenge: AtomicBool::new(false),
             #[cfg(debug_assertions)]
@@ -1463,12 +1466,46 @@ impl ChainHub {
         best
     }
 
-    pub fn note_initial_getheaders_sent(&self) {
-        self.initial_getheaders_sent.fetch_add(1, Ordering::Relaxed);
+    /// Record one initial `getheaders`. The returned id stays outstanding until
+    /// [`Self::retire_initial_getheaders`].
+    pub fn note_initial_getheaders_sent(&self) -> u64 {
+        let id = self
+            .initial_getheaders_sent
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.outstanding_initial_getheaders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(id);
+        id
     }
 
     pub fn initial_getheaders_sent(&self) -> u64 {
         self.initial_getheaders_sent.load(Ordering::Relaxed)
+    }
+
+    /// The initial `getheaders` with this id has been applied.
+    pub fn retire_initial_getheaders(&self, id: u64) {
+        if id == 0 {
+            return;
+        }
+        let mut open = self
+            .outstanding_initial_getheaders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = open.iter().position(|queued| *queued == id) {
+            open.swap_remove(at);
+        }
+    }
+
+    /// Initial `getheaders` ids issued after `sent0` that are not applied yet.
+    pub fn initial_getheaders_outstanding_after(&self, sent0: u64) -> usize {
+        self.outstanding_initial_getheaders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|id| **id > sent0)
+            .count()
     }
 
     pub fn note_headers_reply(&self) {

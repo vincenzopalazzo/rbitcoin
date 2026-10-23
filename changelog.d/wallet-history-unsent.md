@@ -1,3 +1,3 @@
 Fixed
 
-- **Electrum stays down until the follow headers round is indexed.** A block mined while scripthash materialize runs is no longer missing from the first history answer. The bind waits until that `getheaders` has been applied and the scripthash head covers the tip, not merely until the message is counted or two seconds have passed.
+- **Electrum stays down until the follow headers round is applied.** The bind waits until each initial `getheaders` sent after the follow dials has been applied, the header tip is not ahead of the block tip, and the scripthash head covers that tip. A headers message that is not one of those sends does not open it, and neither does a two-second timeout.

@@ -5143,6 +5143,72 @@ async fn over_budget_headers_are_stored_without_a_follow_up() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Only the session that was asked retires its initial getheaders. Another
+/// peer's headers leave that id outstanding, and the asked peer's connecting
+/// header is stored before the id is gone.
+#[tokio::test]
+async fn initial_getheaders_retires_only_the_asked_session() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("hdr-initial-round");
+    hub.ensure_genesis().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let asked = live_peer(&peers, 18512, 33, false);
+    let other = live_peer(&peers, 18513, 34, false);
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    assert!(
+        maybe_queue_initial_getheaders(&out_tx, &hub, &asked),
+        "the first peer starts headers sync"
+    );
+    assert_eq!(hub.initial_getheaders_outstanding_after(0), 1);
+    let _ = out_rx.try_recv();
+    let mut follow = PeerFollowState::new();
+    handle_decoded_peer_msg(
+        RawNetworkMessage::new(
+            Magic::from(Network::Regtest),
+            NetworkMessage::Headers(vec![]),
+        ),
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(other.as_ref()),
+    )
+    .await
+    .expect("other headers");
+    assert_eq!(
+        hub.initial_getheaders_outstanding_after(0),
+        1,
+        "another peer's headers do not finish the asked round"
+    );
+    let header = rbitcoin_consensus::mine_regtest_paying(
+        hub.tip_hash().unwrap(),
+        hub.tip_header().unwrap().time.saturating_add(600),
+        hub.tip_height().unwrap().saturating_add(1),
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    )
+    .header;
+    let hash = header.block_hash();
+    let tip = hub.tip_height().unwrap_or(0);
+    handle_decoded_peer_msg(
+        RawNetworkMessage::new(
+            Magic::from(Network::Regtest),
+            NetworkMessage::Headers(vec![header]),
+        ),
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(asked.as_ref()),
+    )
+    .await
+    .expect("asked headers");
+    assert_eq!(hub.initial_getheaders_outstanding_after(0), 0);
+    assert!(hub.header_of(&hash).is_some(), "the header is stored");
+    assert!(
+        hub.best_header_height() > tip,
+        "the header tip leads the connected tip when the round ends"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A closed writer fails the getdata. The claim from that attempt is released
 /// so another peer can ask.
 #[tokio::test]

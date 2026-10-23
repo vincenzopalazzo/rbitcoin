@@ -1008,7 +1008,7 @@ async fn wallet_history_stays_down_until_getheaders_or_shutdown() {
     node.follow_live.fetch_add(1, Ordering::SeqCst);
     let shutdown = Shutdown::new();
     let pending = {
-        let mut wait = std::pin::pin!(wait_wallet_history(&node, true, &shutdown, (0, 0)));
+        let mut wait = std::pin::pin!(wait_wallet_history(&node, true, &shutdown, 0));
         let pending = tokio::select! {
             _ = &mut wait => false,
             _ = tokio::time::sleep(Duration::from_millis(2_500)) => true,
@@ -1025,5 +1025,54 @@ async fn wallet_history_stays_down_until_getheaders_or_shutdown() {
     assert!(
         pending,
         "wallet history returned before getheaders was sent"
+    );
+}
+
+/// A headers tally that is not the post-mark follow send must not open the bind.
+#[tokio::test]
+async fn wallet_history_ignores_headers_that_are_not_the_follow_round() {
+    use std::sync::atomic::Ordering;
+
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_net::{P2PNode, REDIAL_INTERVAL_TEST};
+
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-wallet-history-round-{n}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let query = Query::open_or_create_tiny(dir.join("store")).unwrap();
+    let node = P2PNode::start(
+        "127.0.0.1:0".parse().unwrap(),
+        query,
+        ChainParams::regtest(),
+        Milestone::NONE,
+        REDIAL_INTERVAL_TEST,
+    )
+    .await
+    .expect("listen");
+    node.follow_live.fetch_add(1, Ordering::SeqCst);
+    let id = node.hub.note_initial_getheaders_sent();
+    node.hub.note_headers_reply();
+    let shutdown = Shutdown::new();
+    let held = {
+        let mut wait = std::pin::pin!(wait_wallet_history(&node, false, &shutdown, 0));
+        let held = tokio::select! {
+            _ = &mut wait => false,
+            _ = tokio::time::sleep(Duration::from_millis(400)) => true,
+        };
+        node.hub.retire_initial_getheaders(id);
+        tokio::time::timeout(Duration::from_secs(2), &mut wait)
+            .await
+            .expect("the applied follow round releases the wallet bind");
+        held
+    };
+    node.follow_live.fetch_sub(1, Ordering::SeqCst);
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        held,
+        "a headers reply that is not the follow round released the wallet bind"
     );
 }
