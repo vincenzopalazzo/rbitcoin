@@ -955,8 +955,9 @@ impl ChainHub {
         if mp.pool_maintained() || self.in_ibd() {
             return;
         }
-        mp.begin_pool_maintenance();
-        info!("ibd: leaving IBD — maintaining the mempool");
+        if mp.begin_pool_maintenance() {
+            info!("ibd: leaving IBD — maintaining the mempool");
+        }
     }
 
     /// Claimed nBits meet `pow_limit` and the hash meets that target.

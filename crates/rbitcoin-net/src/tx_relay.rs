@@ -1420,9 +1420,13 @@ impl MempoolHub {
     /// mempool.
     pub fn set_relay_enabled(&self, on: bool) {
         let prev = self.relay_enabled();
+        // A failed purge leaves maintenance off. Do not record relay as on,
+        // or this edge never runs again and the purge is skipped for good.
+        if on && !self.begin_pool_maintenance() {
+            return;
+        }
         if on && !prev {
             self.fee_backfill_due.store(true, Ordering::Release);
-            self.begin_pool_maintenance();
         }
         self.relay_enabled.store(on, Ordering::SeqCst);
     }
@@ -1437,20 +1441,29 @@ impl MempoolHub {
     }
 
     /// One-shot: purge txs the chain already confirmed and mark the template
-    /// tip. Later connects strip per block. Does not enable peer relay or
-    /// fee-history preload. A second call does nothing.
+    /// tip, then publish maintenance. Later connects strip per block. Does
+    /// not enable peer relay or fee-history preload. A second call does nothing.
     ///
-    /// Takes `template_prev`. Callers that hold [`TemplateHold`] must drop it
-    /// first.
-    pub fn begin_pool_maintenance(&self) {
-        if self.pool_maintained.swap(true, Ordering::AcqRel) {
-            return;
+    /// Returns false when the purge hits a store fault. The flag stays clear
+    /// so the next successful call retries. Takes `template_prev` before the
+    /// flag is visible. Callers that hold [`TemplateHold`] must drop it first.
+    pub fn begin_pool_maintenance(&self) -> bool {
+        if self.pool_maintained.load(Ordering::Acquire) {
+            return true;
         }
         // Same lock `connect_at` holds from before the query tip moves until
         // the strip is recorded. Take it before the purge so the two never
-        // invert lock order with the mempool write lock.
+        // invert lock order with the mempool write lock. Listing and
+        // `generate` do not take this lock, so the flag has to wait until
+        // the purge has finished.
         let mut slot = self.template_prev.lock().unwrap();
-        let n = self.purge_confirmed_on_chain();
+        if self.pool_maintained.load(Ordering::Acquire) {
+            return true;
+        }
+        let n = match self.purge_confirmed() {
+            Ok(n) => n,
+            Err(()) => return false,
+        };
         if n > 0 {
             rbitcoin_log::info!(
                 "mempool: purged {n} leftover tx(s) at tip-mode entry (deferred during IBD)"
@@ -1471,6 +1484,8 @@ impl MempoolHub {
         if marked {
             self.note_template_update();
         }
+        self.pool_maintained.store(true, Ordering::Release);
+        true
     }
 
     /// One-shot: relay just turned on and fee history has not been preloaded.
@@ -1683,15 +1698,22 @@ impl MempoolHub {
     /// Used once when enabling relay after catch-up. Same-txid hits keep
     /// in-mempool descendants; conflicts drop the loser tree. Persists DEAD
     /// marks even when compact does not fire. Returns how many txs removed.
+    /// A store fault is 0 here; [`Self::begin_pool_maintenance`] uses the
+    /// fallible path and does not publish maintenance when that happens.
     pub fn purge_confirmed_on_chain(&self) -> usize {
+        self.purge_confirmed().unwrap_or(0)
+    }
+
+    #[allow(clippy::result_unit_err)] // a store fault is (); maintenance stays unpublished
+    fn purge_confirmed(&self) -> Result<usize, ()> {
         let live: Vec<Txid> = {
             let g = self.lock_read();
             g.graph.iter().map(|(t, _)| *t).collect()
         };
         if live.is_empty() {
-            return 0;
+            return Ok(0);
         }
-        let to_drop = self.live_confirmed_strong(&live).unwrap_or_default();
+        let to_drop = self.live_confirmed_strong(&live)?;
         let mut g = self.lock_write();
         let drop_set: HashSet<Txid> = to_drop
             .iter()
@@ -1704,13 +1726,11 @@ impl MempoolHub {
             .map(|(t, _)| *t)
             .filter(|t| !drop_set.contains(t))
             .collect();
-        let spent_ops = self
-            .spent_chain_prevouts(&g, &remain, &drop_set)
-            .unwrap_or_default();
+        let spent_ops = self.spent_chain_prevouts(&g, &remain, &drop_set)?;
         let confirmed: Vec<Txid> = drop_set.into_iter().collect();
         let (_, conflicts) = g
             .remove_block_txids(&confirmed, &spent_ops)
-            .unwrap_or((0, Vec::new()));
+            .map_err(|_| ())?;
         // Only txs the graph actually dropped. A count check here is the same
         // result whenever every listed tx left, and the other branch kept a
         // still-live tx in the unindex set.
@@ -1720,14 +1740,14 @@ impl MempoolHub {
             .collect();
         gone.extend(conflicts);
         if gone.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let _ = g.maybe_compact();
         let _ = g.persist_if_dirty();
         self.mark_fee_dirty();
         drop(g);
         self.unindex_evicted(&gone);
-        gone.len()
+        Ok(gone.len())
     }
 
     #[doc(hidden)]

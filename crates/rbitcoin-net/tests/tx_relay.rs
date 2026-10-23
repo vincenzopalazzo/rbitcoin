@@ -1780,6 +1780,39 @@ fn purge_confirmed_drops_relay_maps() {
     let _ = std::fs::remove_dir_all(&store);
 }
 
+/// The maintained flag is the Ready bit for listing and `generate`. It must
+/// stay clear while `begin_pool_maintenance` is still waiting on the template
+/// lock, which it holds across the purge.
+#[test]
+fn maintenance_flag_stays_clear_until_the_purge_lock() {
+    let dir = tmp();
+    let store_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let mp = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+    let hold = mp.template_hold();
+    let bg = Arc::clone(&mp);
+    let started = std::thread::spawn(move || bg.begin_pool_maintenance());
+    for _ in 0..40 {
+        if started.is_finished() || mp.pool_maintained() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !started.is_finished(),
+        "begin returned while the template hold was still held"
+    );
+    assert!(
+        !mp.pool_maintained(),
+        "maintenance became visible before the purge could take the template lock"
+    );
+    drop(hold);
+    started.join().expect("begin");
+    assert!(mp.pool_maintained());
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
 /// Before maintenance begins, per-block remove is deferred. Enabling relay
 /// starts maintenance and runs the purge.
 #[test]
