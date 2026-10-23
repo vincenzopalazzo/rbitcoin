@@ -1221,7 +1221,7 @@ async fn sync_to(dir: &Path, peers: &[SocketAddr], tip: &bitcoin::Block, height:
     let node = start_node(dir, split_params()).await;
     let addrs: Vec<NetAddr> = peers.iter().copied().map(NetAddr::Ip).collect();
     tokio::time::timeout(
-        Duration::from_secs(20),
+        llvm_cov_wall(20, 60),
         rbitcoin_ibd::sync(&node, &addrs, IbdConfig::for_test()),
     )
     .await
