@@ -887,14 +887,18 @@ fn blocksonly_lists_mempool_mines_and_refuses_template() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Production `-blocksonly` never turns relay on. `generate` still mines the
-/// pool transaction and that txid is gone before the RPC returns. A strip
-/// that no-ops while relay is off would leave it listed.
+/// Production `-blocksonly` never starts maintenance. `generate` still mines
+/// the pool transaction and that txid is gone before the RPC returns.
+/// Connect's strip is off on this pool, so `commit_generated_txids` is what
+/// removes it.
 #[test]
 fn blocksonly_generate_removes_the_tx_it_mines() {
-    let (mut ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (mut ctx, dir, _hub) = ctx_from_mature_pad_relay(300_000_000, false);
     ctx.blocksonly = true;
-    ctx.mempool.as_ref().unwrap().set_relay_enabled(false);
+    assert!(
+        !ctx.mempool.as_ref().unwrap().pool_maintained(),
+        "strip is on, so this no longer pins commit_generated_txids"
+    );
     let (hex, spend) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 1_000);
     let txid = spend.compute_txid();
     dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
@@ -934,9 +938,12 @@ fn generate_over_cap_leaves_the_pool() {
 /// the next `generate` would select them again and could not connect them.
 #[test]
 fn generate_later_block_failure_still_drops_the_mined_tx() {
-    let (mut ctx, dir, hub) = ctx_from_mature_pad(300_000_000);
+    let (mut ctx, dir, hub) = ctx_from_mature_pad_relay(300_000_000, false);
     ctx.blocksonly = true;
-    ctx.mempool.as_ref().unwrap().set_relay_enabled(false);
+    assert!(
+        !ctx.mempool.as_ref().unwrap().pool_maintained(),
+        "strip is on, so this no longer pins commit_generated_txids"
+    );
     let (hex, spend) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 1_000);
     let txid = spend.compute_txid();
     dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
