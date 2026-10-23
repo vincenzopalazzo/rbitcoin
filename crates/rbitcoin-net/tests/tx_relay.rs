@@ -1780,7 +1780,8 @@ fn purge_confirmed_drops_relay_maps() {
     let _ = std::fs::remove_dir_all(&store);
 }
 
-/// While relay is off, per-block remove is deferred; enabling relay runs purge.
+/// Before maintenance begins, per-block remove is deferred. Enabling relay
+/// starts maintenance and runs the purge.
 #[test]
 fn remove_for_block_skipped_until_relay_then_purge() {
     let dir = tmp();
@@ -1788,9 +1789,10 @@ fn remove_for_block_skipped_until_relay_then_purge() {
     let q = Query::open_or_create_tiny(&store_dir).unwrap();
     let mp = MempoolHub::open(&dir, Arc::new(q)).unwrap();
     assert!(!mp.relay_enabled());
+    assert!(!mp.pool_maintained());
     let dummy = Txid::from_byte_array([9u8; 32]);
     mp.prioritise_tx(dummy, 3);
-    // Strip stays deferred while relay is off. The mined delta still drops.
+    // Strip stays deferred until maintenance begins. The mined delta still drops.
     assert_eq!(mp.remove_for_block(&[dummy]), 0);
     assert_eq!(
         mp.fee_delta(&dummy),
@@ -1800,6 +1802,7 @@ fn remove_for_block_skipped_until_relay_then_purge() {
     // Enabling relay runs purge (empty → 0) and arms per-block strip.
     mp.set_relay_enabled(true);
     assert!(mp.relay_enabled());
+    assert!(mp.pool_maintained());
     assert_eq!(mp.purge_confirmed_on_chain(), 0);
     // Still no-op for unknown txid, but path is live.
     assert_eq!(mp.remove_for_block(&[dummy]), 0);

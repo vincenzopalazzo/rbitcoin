@@ -1180,11 +1180,12 @@ fn ibd_accept_does_not_fill_recent_confirmed_wtxid() {
 }
 
 /// Regtest `generate` runs while scripthash materialize still holds the
-/// startup task, so the tip-follow loop has not enabled relay yet.
-/// A fresh tip must turn relay on in `connect_at` or `getblocktemplate`
-/// refuses the new pool (`feature_nulldummy`).
+/// startup task, so the tip-follow loop has not enabled peer relay yet.
+/// Leaving IBD on this path maintains the pool (purge, then per-block
+/// strip) so `getblocktemplate` can run. It does not tell peers about
+/// transactions or preload fee history (`feature_nulldummy`).
 #[test]
-fn fresh_tip_accept_enables_relay_before_tip_follow() {
+fn fresh_tip_accept_maintains_pool_without_peer_relay() {
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
     let mp =
@@ -1198,22 +1199,43 @@ fn fresh_tip_accept_enables_relay_before_tip_follow() {
     hub.accept_block(mine(gen, now, 1)).unwrap();
     assert!(!hub.in_ibd());
     assert!(
-        mp.relay_enabled(),
-        "leaving IBD on the accept path enables relay before tip-follow starts"
+        !mp.relay_enabled(),
+        "leaving IBD maintains the pool and leaves peer relay off"
     );
     assert!(
-        mp.take_fee_backfill_due(),
-        "the accept-path flip still owes fee-history preload"
+        mp.pool_maintained(),
+        "leaving IBD purges the pool and strips later blocks"
     );
     assert!(
-        mp.take_feefilter_refresh_due(),
-        "leaving IBD latches a feefilter refresh for tip-follow"
+        !mp.take_fee_backfill_due(),
+        "fee-history preload waits until peer relay turns on"
     );
-    mp.set_relay_enabled(true);
+    // Coinbase at height 1 matures once the tip reaches 101. Those blocks
+    // are still inside the pack, with relay off, and must strip.
+    hub.generate_to_script(100, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    assert!(!mp.relay_enabled());
+    let spend = mature_spend_tx(&hub, 1);
+    let txid = spend.compute_txid();
+    mp.accept_tx(&spend).expect("mature coinbase spend");
+    assert_eq!(mp.live_count(), 1);
+    let prev = hub.tip_hash().unwrap();
+    let time = hub.tip_header().unwrap().time.saturating_add(1);
+    let height = hub.tip_height().unwrap().saturating_add(1);
+    let block = rbitcoin_consensus::mine_regtest_paying(
+        prev,
+        time,
+        height,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![spend],
+    );
+    hub.accept_block(block)
+        .expect("block confirms the mempool tx");
     assert!(
-        !mp.take_feefilter_refresh_due(),
-        "relay already on does not latch another refresh"
+        !mp.contains(&txid),
+        "a later block strips while peer relay is still off"
     );
+    assert!(!mp.relay_enabled());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1233,14 +1255,14 @@ fn fresh_tip_accept_stays_quiet_when_blocks_only() {
     hub.accept_block(mine(gen, now, 1)).unwrap();
     assert!(!hub.in_ibd());
     assert!(!mp.relay_enabled());
+    assert!(!mp.pool_maintained());
     assert!(!mp.take_fee_backfill_due());
-    assert!(!mp.take_feefilter_refresh_due());
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Relay paused after IBD has already ended stays paused. The catch-up
-/// purge runs when relay is turned on, not on the next block
-/// (`peer_blocksonly`).
+/// A relay pause after IBD has already ended stays paused, and that later
+/// block does not start maintenance. The catch-up purge runs when relay is
+/// turned on (`peer_blocksonly`).
 #[test]
 fn fresh_tip_does_not_reenable_relay_once_ibd_has_ended() {
     let (dir, hub) = tmp_hub();
@@ -1252,12 +1274,19 @@ fn fresh_tip_does_not_reenable_relay_once_ibd_has_ended() {
     let gen = hub.tip_hash().unwrap();
     let now = hub.clock.now_secs() as u32;
     hub.accept_block(mine(gen, now, 1)).unwrap();
-    assert!(mp.relay_enabled());
-    assert!(mp.take_feefilter_refresh_due());
-    mp.set_relay_enabled(false);
     assert!(
-        mp.take_feefilter_refresh_due(),
-        "pausing relay latches a feefilter refresh"
+        !mp.relay_enabled(),
+        "the block that leaves IBD does not enable peer relay"
+    );
+    assert!(mp.pool_maintained());
+    assert!(!mp.take_fee_backfill_due());
+    mp.set_relay_enabled(true);
+    assert!(mp.take_fee_backfill_due());
+    mp.set_relay_enabled(false);
+    assert!(!mp.take_fee_backfill_due());
+    assert!(
+        mp.pool_maintained(),
+        "pausing peer relay leaves maintenance on"
     );
     let tip = hub.tip_hash().unwrap();
     hub.accept_block(mine(tip, now.saturating_add(1), 2))
@@ -1267,7 +1296,7 @@ fn fresh_tip_does_not_reenable_relay_once_ibd_has_ended() {
         !mp.relay_enabled(),
         "a fresh tip with relay already paused stays paused"
     );
-    assert!(!mp.take_feefilter_refresh_due());
+    assert!(mp.pool_maintained());
     let _ = std::fs::remove_dir_all(dir);
 }
 

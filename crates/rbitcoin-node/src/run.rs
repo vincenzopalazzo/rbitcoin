@@ -1317,17 +1317,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 let want_relay = !config.mempool.blocksonly && minwork && !ibd;
                 if want_relay != mempool.relay_enabled() {
                     mempool_blocking(&mempool, move |mp| mp.set_relay_enabled(want_relay)).await?;
+                    node.peers
+                        .queue_feefilter_all(node.hub.feefilter_sat_kvb() as i64);
                     if want_relay {
                         info!("ibd: leaving IBD — enabling tx relay");
                     } else {
                         info!("ibd: entering IBD — pausing tx relay");
                     }
-                }
-                // Accept and the startup arm flip relay before this loop
-                // reads it. The latch is the one signal to re-advertise.
-                if mempool_blocking(&mempool, MempoolHub::take_feefilter_refresh_due).await? {
-                    node.peers
-                        .queue_feefilter_all(node.hub.feefilter_sat_kvb() as i64);
                 }
                 if want_relay
                     && mempool_blocking(&mempool, MempoolHub::take_fee_backfill_due).await?

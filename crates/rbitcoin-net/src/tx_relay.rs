@@ -716,12 +716,12 @@ pub struct MempoolHub {
     pub query: Arc<Query>,
     /// When false, peers' tx inv/tx are ignored (IBD / catch-up).
     pub relay_enabled: AtomicBool,
+    /// Set once the pool has been purged and later blocks strip it. Stays set
+    /// when peer relay is paused. `-blocksonly` never sets it.
+    pool_maintained: AtomicBool,
     /// Set when relay flips off to on. The node supervisor spawns fee-history
-    /// backfill and clears it. Accept may flip relay before that loop runs.
+    /// backfill and clears it. That waits for peer relay, not pool maintenance.
     fee_backfill_due: AtomicBool,
-    /// Set on any relay edge. Tip-follow re-advertises BIP133 feefilter and
-    /// clears it. Accept can flip relay before that loop sees the edge.
-    feefilter_refresh_due: AtomicBool,
     /// Session id of the current trusted peer. [`u64::MAX`] means none.
     pub trusted_session: AtomicU64,
     /// Broadcast accepts so sessions can inv (origin exclusion is per-session).
@@ -984,8 +984,8 @@ impl MempoolHub {
             inner: RwLock::new(mp),
             query,
             relay_enabled: AtomicBool::new(false),
+            pool_maintained: AtomicBool::new(false),
             fee_backfill_due: AtomicBool::new(false),
-            feefilter_refresh_due: AtomicBool::new(false),
             trusted_session: AtomicU64::new(u64::MAX),
             announce,
             inv_flush,
@@ -1413,44 +1413,16 @@ impl MempoolHub {
 
     /// Enable/disable peer tx inv/accept (false during IBD catch-up).
     ///
-    /// **False → true:** bulk-strip txs that are already confirmed-strong on the
-    /// best chain, and live txs whose inputs are confirmed-spent by a different
-    /// txid (catch-up conflicts). Per-block [`Self::remove_for_block`] is skipped
-    /// while relay is off so catch-up is not paced by a large durable mempool
-    /// (mainnet: 40k+ live after offline). One purge at tip-mode entry is enough
-    /// before relay.
+    /// **False → true** starts pool maintenance when the accept path has not
+    /// already, and owes fee-history preload. Turning relay off does not stop
+    /// maintenance: per-block strip keeps running. Bulk IBD still skips that
+    /// strip until relay is on, so catch-up is not paced by a large durable
+    /// mempool.
     pub fn set_relay_enabled(&self, on: bool) {
         let prev = self.relay_enabled();
         if on && !prev {
             self.fee_backfill_due.store(true, Ordering::Release);
-            // Same lock `connect_at` holds from before the query tip moves
-            // until the strip is recorded. Take it before the purge so the
-            // two never invert lock order with the mempool write lock.
-            let mut slot = self.template_prev.lock().unwrap();
-            let n = self.purge_confirmed_on_chain();
-            if n > 0 {
-                rbitcoin_log::info!(
-                    "mempool: purged {n} leftover tx(s) at tip-mode entry (deferred during IBD)"
-                );
-            }
-            let marked = if let Some(h) = self.query.tip_height() {
-                if let Ok(Some((_, rec))) = self.query.header_at_height(h) {
-                    let changed = *slot != Some(rec.hash);
-                    *slot = Some(rec.hash);
-                    changed
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            drop(slot);
-            if marked {
-                self.note_template_update();
-            }
-        }
-        if on != prev {
-            self.feefilter_refresh_due.store(true, Ordering::Release);
+            self.begin_pool_maintenance();
         }
         self.relay_enabled.store(on, Ordering::SeqCst);
     }
@@ -1459,14 +1431,51 @@ impl MempoolHub {
         self.relay_enabled.load(Ordering::SeqCst)
     }
 
+    /// The pool is purged and later blocks strip it. Peer relay may still be off.
+    pub fn pool_maintained(&self) -> bool {
+        self.pool_maintained.load(Ordering::Acquire)
+    }
+
+    /// One-shot: purge txs the chain already confirmed and mark the template
+    /// tip. Later connects strip per block. Does not enable peer relay or
+    /// fee-history preload. A second call does nothing.
+    ///
+    /// Takes `template_prev`. Callers that hold [`TemplateHold`] must drop it
+    /// first.
+    pub fn begin_pool_maintenance(&self) {
+        if self.pool_maintained.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Same lock `connect_at` holds from before the query tip moves until
+        // the strip is recorded. Take it before the purge so the two never
+        // invert lock order with the mempool write lock.
+        let mut slot = self.template_prev.lock().unwrap();
+        let n = self.purge_confirmed_on_chain();
+        if n > 0 {
+            rbitcoin_log::info!(
+                "mempool: purged {n} leftover tx(s) at tip-mode entry (deferred during IBD)"
+            );
+        }
+        let marked = if let Some(h) = self.query.tip_height() {
+            if let Ok(Some((_, rec))) = self.query.header_at_height(h) {
+                let changed = *slot != Some(rec.hash);
+                *slot = Some(rec.hash);
+                changed
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        drop(slot);
+        if marked {
+            self.note_template_update();
+        }
+    }
+
     /// One-shot: relay just turned on and fee history has not been preloaded.
     pub fn take_fee_backfill_due(&self) -> bool {
         self.fee_backfill_due.swap(false, Ordering::AcqRel)
-    }
-
-    /// One-shot: relay changed and peers still need a BIP133 feefilter.
-    pub fn take_feefilter_refresh_due(&self) -> bool {
-        self.feefilter_refresh_due.swap(false, Ordering::AcqRel)
     }
 
     pub fn set_immediate_relay(&self, on: bool) {
@@ -3295,13 +3304,13 @@ impl MempoolHub {
     /// Samples removed entries' feerates into confirm-memory for the standard
     /// 10-minute fee estimate floor.
     ///
-    /// **Strip is a no-op while relay is disabled** (IBD catch-up). Callers
-    /// must not rely on per-block strip until [`Self::set_relay_enabled`]`(true)`
-    /// has run the deferred [`Self::purge_confirmed_on_chain`]. Mined
+    /// **Strip is a no-op until pool maintenance has begun** (the connect that
+    /// leaves IBD, or [`Self::set_relay_enabled`]`(true)`). Bulk IBD does not
+    /// start maintenance, so catch-up is not paced by a large pool. Mined
     /// prioritisation deltas still drop, including a tx that already left
     /// the mempool and a block that removes nothing live.
     pub fn remove_for_block(&self, txids: &[Txid]) -> usize {
-        if !self.relay_enabled() {
+        if !self.pool_maintained() {
             self.drop_mined_fee_deltas(txids);
             return 0;
         }
@@ -3339,7 +3348,7 @@ impl MempoolHub {
     /// Remove confirmed txids, then evict mempool txs that spend `spent`
     /// (block inputs that conflicted with the live set).
     pub fn remove_for_block_spent(&self, txids: &[Txid], spent: &[OutPoint]) -> usize {
-        if !self.relay_enabled() {
+        if !self.pool_maintained() {
             self.drop_mined_fee_deltas(txids);
             return 0;
         }

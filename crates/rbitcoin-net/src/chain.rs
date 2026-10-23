@@ -931,31 +931,32 @@ impl ChainHub {
         *self.minimum_chain_work.write().unwrap() = w;
     }
 
-    /// `-blocksonly`: the accept path must not enable tx relay.
+    /// `-blocksonly`: the accept path must not maintain the pool or relay.
     pub fn set_blocks_only(&self, on: bool) {
         self.blocks_only.store(on, Ordering::Release);
     }
 
-    /// Turn tx relay on when this connect is what leaves IBD.
+    /// Start pool maintenance when this connect is what leaves IBD.
     ///
-    /// The tip-follow loop does this too, but it starts only after scripthash
-    /// materialize. Regtest `generate` runs during that wait. `was_ibd` is
-    /// `in_ibd()` from before the block landed: a tip that was already fresh
-    /// keeps a paused relay (catch-up purge stays at tip-mode entry). Call
-    /// this after the template hold is dropped so the purge can take the
-    /// same mutex.
-    pub fn enable_relay_after_ibd(&self, was_ibd: bool) {
+    /// Peer relay stays off. The tip-follow loop enables it after scripthash
+    /// materialize. Regtest `generate` runs during that wait and needs a
+    /// maintained pool for `getblocktemplate`. `was_ibd` is `in_ibd()` from
+    /// before the block landed: a tip that was already fresh does not start
+    /// maintenance (a paused relay keeps its catch-up purge at tip-mode
+    /// entry). Call this after the template hold is dropped so the purge can
+    /// take the same mutex.
+    pub fn maintain_pool_after_ibd(&self, was_ibd: bool) {
         if !was_ibd || self.blocks_only.load(Ordering::Acquire) {
             return;
         }
         let Some(mp) = self.mempool() else {
             return;
         };
-        if mp.relay_enabled() || self.in_ibd() {
+        if mp.pool_maintained() || self.in_ibd() {
             return;
         }
-        mp.set_relay_enabled(true);
-        info!("ibd: leaving IBD — enabling tx relay");
+        mp.begin_pool_maintenance();
+        info!("ibd: leaving IBD — maintaining the mempool");
     }
 
     /// Claimed nBits meet `pow_limit` and the hash meets that target.
@@ -3822,7 +3823,7 @@ impl ChainHub {
             let spent = spent_outpoints(&block.txdata);
             let n = mp.remove_for_block_spent(&ids, &spent);
             rbitcoin_log::debug!("mempool: removed {n} confirmed tx(s) @ height {height}");
-            if mp.relay_enabled() {
+            if mp.pool_maintained() {
                 mp.note_block_fee_history(Height(height));
                 if let Some(hold) = template_hold.as_mut() {
                     hold.commit(hash.to_byte_array());
@@ -3840,11 +3841,11 @@ impl ChainHub {
         info!("{}", log_update_tip_line(height, &hash, &header, tx_count));
         log_tip_accept_sh(&self.query, height, tx_count, wall_ns, mp_strip_ns, pres_ns);
         // Record the stripped tip before the announcement, so a builder that
-        // wakes on this event already sees the new mark. Relay flips here,
-        // after that hold, so a template built on the event is not refused
-        // for a catch-up pool that tip-follow has not reached yet.
+        // wakes on this event already sees the new mark. Maintenance starts
+        // here, after that hold, so a template built on the event is not
+        // refused for a catch-up pool. Peer relay stays with tip-follow.
         drop(template_hold);
-        self.enable_relay_after_ibd(was_ibd);
+        self.maintain_pool_after_ibd(was_ibd);
         let event = TipEvent {
             height,
             hash,
