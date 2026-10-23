@@ -2220,7 +2220,10 @@ impl ChainHub {
         if let Some(mp) = self.mempool() {
             mp.clear_recent_rejects();
             let mut stripped: Option<[u8; 32]> = None;
-            if mp.relay_enabled() {
+            // Catch-up can still write blocks after maintenance starts.
+            // Strip those too. Reconstructing before the latch would pace
+            // IBD on the pool. Recently-confirmed filtering stays with relay.
+            if mp.pool_maintained() {
                 for &(height, hash) in need_meta {
                     mp.note_block_fee_history(Height(height));
                     let Ok(Some(block)) =
@@ -2228,7 +2231,9 @@ impl ChainHub {
                     else {
                         break;
                     };
-                    mp.note_recent_confirmed(&block.txdata);
+                    if mp.relay_enabled() {
+                        mp.note_recent_confirmed(&block.txdata);
+                    }
                     let ids: Vec<_> = block.txdata.iter().map(|t| t.compute_txid()).collect();
                     let spent = spent_outpoints(&block.txdata);
                     let n = mp.remove_for_block_spent(&ids, &spent);
