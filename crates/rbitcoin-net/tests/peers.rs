@@ -653,6 +653,63 @@ fn trust_peer_skips_high_bandwidth() {
     );
 }
 
+/// Startup packs the scripthash index after the tip leaves IBD and before
+/// peer tx relay flips. The next block from a peer is still a high-bandwidth
+/// candidate. The pack itself must not be. `-blocksonly` never selects.
+#[test]
+fn hb_selects_once_ibd_ends_while_tx_relay_is_off() {
+    use rbitcoin_net::peer::maybe_select_hb_if_relay;
+
+    let (dir, chain) = rbitcoin_net::chain::tiny_regtest_hub_labeled("hb-before-relay");
+    let mp = rbitcoin_net::tx_relay::MempoolHub::open(
+        dir.path().join("mp"),
+        std::sync::Arc::clone(&chain.query),
+    )
+    .unwrap();
+    assert!(chain.attach_mempool(std::sync::Arc::clone(&mp)).is_ok());
+    assert!(chain.in_ibd(), "regtest genesis is older than 24h");
+    assert!(!mp.relay_enabled());
+
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let join = |hub: &Arc<PeerHub>, addr: SocketAddr| {
+        hub.register(
+            addr,
+            bind,
+            &ver("/rbitcoin:0.1.0/"),
+            true,
+            PeerConnType::Inbound,
+        )
+    };
+    let during = PeerHub::new();
+    let ibd_peer = join(&during, "1.2.3.4:8333".parse().unwrap());
+    maybe_select_hb_if_relay(&chain, Some(&ibd_peer));
+    assert!(
+        !ibd_peer.hb_to.load(Ordering::Relaxed),
+        "IBD must not select a high-bandwidth peer"
+    );
+
+    chain.finished_ibd.store(true, Ordering::Release);
+    assert!(!chain.in_ibd());
+    assert!(
+        !mp.relay_enabled(),
+        "peer tx relay stays off through the pack"
+    );
+    maybe_select_hb_if_relay(&chain, Some(&ibd_peer));
+    assert!(
+        ibd_peer.hb_to.load(Ordering::Relaxed),
+        "a peer that delivers a block after IBD is high-bandwidth before tx relay"
+    );
+
+    chain.set_blocks_only(true);
+    let quiet = PeerHub::new();
+    let blocked = join(&quiet, "1.2.3.5:8333".parse().unwrap());
+    maybe_select_hb_if_relay(&chain, Some(&blocked));
+    assert!(
+        !blocked.hb_to.load(Ordering::Relaxed),
+        "blocksonly must not select a high-bandwidth peer"
+    );
+}
+
 fn hold_session(hub: &Arc<PeerHub>, addr: SocketAddr) -> Arc<LivePeer> {
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
     hub.register(

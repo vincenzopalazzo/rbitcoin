@@ -2269,9 +2269,11 @@ async fn sync_tx_relay(
 /// Scripthash materialize holds the process before dial. The miner can add
 /// a block in that window. Opening Electrum on the pre-dial tip serves a
 /// history that does not include it. Relay follows IBD on each tick of this
-/// wait, so a block accepted after that flip can be selected for
-/// high-bandwidth compact relay. An accept already on the lane sampled relay
-/// before connect and is not selected by this tick.
+/// wait, so peer announcements and the fee filter start before the
+/// tip-follow loop. High-bandwidth compact selection follows IBD itself,
+/// so a block accepted during the pack can be selected while this bit is
+/// still off. An accept that is the one leaving IBD sampled that state
+/// before connect and is not selected.
 pub async fn wait_wallet_history(
     node: &P2PNode,
     config: &NodeConfig,

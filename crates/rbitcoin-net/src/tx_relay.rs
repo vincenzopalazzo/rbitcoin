@@ -1419,8 +1419,8 @@ impl MempoolHub {
     /// **False → true** starts pool maintenance when the accept path has not
     /// already, and owes fee-history preload. Turning relay off does not stop
     /// maintenance: per-block strip keeps running. Bulk IBD still skips that
-    /// strip until relay is on, so catch-up is not paced by a large durable
-    /// mempool.
+    /// strip until the pool is maintained, so catch-up is not paced by a
+    /// large durable mempool before the tip leaves IBD.
     pub fn set_relay_enabled(&self, on: bool) {
         let prev = self.relay_enabled();
         // A failed purge leaves maintenance off. Do not record relay as on,

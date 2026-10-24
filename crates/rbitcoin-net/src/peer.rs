@@ -102,11 +102,25 @@ pub fn reject_unsolicited_tx(hub: &ChainHub, session: Option<&crate::peers::Live
     !session.is_some_and(|s| s.session_relay_perm())
 }
 
-/// BIP152 HB is only for tx-relay peers. Blocks-only must not send
-/// `sendcmpct(announce=1)`.
+/// BIP152 HB starts when the tip leaves IBD. Peer tx relay can still be
+/// off while the index pack runs; that delay must not drop the next
+/// block's announcer. Blocks-only must not send `sendcmpct(announce=1)`.
+/// A hub with no mempool has nothing to hold back.
+#[doc(hidden)]
+pub fn hb_select_allowed(hub: &ChainHub) -> bool {
+    if hub.blocks_only.load(Ordering::Acquire) {
+        return false;
+    }
+    if hub.mempool().is_none() {
+        return true;
+    }
+    !hub.in_ibd()
+}
+
+/// BIP152 HB is only for peers we will take compact blocks from.
 #[doc(hidden)]
 pub fn maybe_select_hb_if_relay(hub: &ChainHub, session: Option<&crate::peers::LivePeer>) {
-    if hub.mempool().is_some_and(|m| !m.relay_enabled()) {
+    if !hb_select_allowed(hub) {
         return;
     }
     let Some(s) = session else {
@@ -142,8 +156,9 @@ pub async fn accept_received_from_peer(
 ) -> Result<AcceptOutcome, NetError> {
     let waive =
         session.is_some_and(|s| s.peer_hub().is_some_and(|ph| ph.session_is_trusted_peer(s)));
-    let relay_ok = hub.mempool().is_none_or(|m| m.relay_enabled());
-    let hb = if relay_ok {
+    // Sample before connect. The block that leaves IBD is not selected.
+    // A later block is, even while peer tx relay is still off.
+    let hb = if hb_select_allowed(hub) {
         session.and_then(|s| s.peer_hub().map(|ph| (ph, s.id)))
     } else {
         None
