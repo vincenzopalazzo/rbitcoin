@@ -931,8 +931,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         // without a live session, including ones past `follow_n`. Hostnames
         // were registered before catch-up (`set_connect_hosts`).
         node.peers.set_connect_addrs(config.listen.connect.clone());
-        // Hold the wallet bind until each post-dial initial getheaders
-        // has been applied and the scripthash head covers the tip.
+        // Hold the wallet bind until each follow dial has published its
+        // headers round and that round has been applied or the peer will
+        // not send getheaders, and the scripthash head covers the tip.
         wait_wallet_history(&node, config.shindex, &shutdown, header_mark).await;
     }
 
@@ -2237,11 +2238,11 @@ pub async fn start_i2p_named_forward(
 ///
 /// `sent0` is the initial-getheaders count before the follow dials.
 /// Scripthash materialize holds the process before those dials, and the miner
-/// can add a block in that window. The wait ends when every initial
-/// `getheaders` sent after `sent0` has been applied, the header tip is not
-/// ahead of the block tip, and the scripthash head covers that tip. A headers
-/// message that is not one of those sends does not end it. Shutdown or 20
-/// seconds does.
+/// can add a block in that window. The wait ends when every follow dial has
+/// published its round, every round sent after `sent0` has been applied or
+/// the peer will not send `getheaders`, the header tip is not ahead of the
+/// block tip, and the scripthash head covers that tip. A headers message
+/// that is not one of those rounds does not end it. Shutdown or 20 seconds does.
 pub async fn wait_wallet_history(node: &P2PNode, shindex: bool, shutdown: &Shutdown, sent0: u64) {
     if node.follow_live_count() == 0 {
         return;
@@ -2252,12 +2253,11 @@ pub async fn wait_wallet_history(node: &P2PNode, shindex: bool, shutdown: &Shutd
         if shutdown.requested() || started.elapsed() >= deadline {
             return;
         }
-        let sent = node.hub.initial_getheaders_sent().saturating_sub(sent0);
-        let open = node.hub.initial_getheaders_outstanding_after(sent0);
+        let (sent, open, pending) = node.hub.wallet_header_gate(sent0);
         let tip = node.tip_height().unwrap_or(0);
         let best = node.hub.best_header_height();
         let sh_ok = !shindex || node.hub.query.sh_is_tip_ready();
-        if sent > 0 && open == 0 && best <= tip && sh_ok {
+        if sent > 0 && open == 0 && pending == 0 && best <= tip && sh_ok {
             return;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;

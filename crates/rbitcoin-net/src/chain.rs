@@ -650,9 +650,12 @@ pub struct ChainHub {
     /// Once the relay-inhibited latch clears, stay out.
     pub finished_ibd: AtomicBool,
     /// Initial `getheaders` queued by follow sessions since process start.
+    /// Bumped only while [`Self::initial_header_rounds`] is held, so a reader
+    /// of that lock sees the id for the new count.
     pub initial_getheaders_sent: AtomicU64,
-    /// Ids from [`Self::note_initial_getheaders_sent`] whose reply is not applied yet.
-    pub outstanding_initial_getheaders: std::sync::Mutex<Vec<u64>>,
+    /// Outstanding initial-getheaders ids, and follow dials whose handshake
+    /// has not published one yet.
+    pub initial_header_rounds: std::sync::Mutex<InitialHeaderRounds>,
     /// `headers` messages applied since process start (including empty).
     pub headers_replies: AtomicU64,
     /// A follow-session block inv during IBD. The walk asks its header peer.
@@ -738,6 +741,22 @@ pub fn remember_stored_header(
     in_batch.insert(hash, HeaderSyncNode { fk, header, height });
 }
 
+/// Initial `getheaders` ids whose reply is not applied yet, and follow dials
+/// that have not published an id.
+pub struct InitialHeaderRounds {
+    ids: Vec<u64>,
+    pending_arm: u64,
+}
+
+impl InitialHeaderRounds {
+    fn new() -> Self {
+        Self {
+            ids: Vec::new(),
+            pending_arm: 0,
+        }
+    }
+}
+
 impl ChainHub {
     pub fn new(query: Query, params: ChainParams, milestone: Milestone) -> Self {
         let (tip_tx, _) = broadcast::channel(64);
@@ -776,7 +795,7 @@ impl ChainHub {
             chain_work_prefix: RwLock::new(Vec::new()),
             finished_ibd: AtomicBool::new(false),
             initial_getheaders_sent: AtomicU64::new(0),
-            outstanding_initial_getheaders: std::sync::Mutex::new(Vec::new()),
+            initial_header_rounds: std::sync::Mutex::new(InitialHeaderRounds::new()),
             headers_replies: AtomicU64::new(0),
             header_inv_challenge: AtomicBool::new(false),
             #[cfg(debug_assertions)]
@@ -1466,18 +1485,48 @@ impl ChainHub {
         best
     }
 
-    /// Record one initial `getheaders`. The returned id stays outstanding until
-    /// [`Self::retire_initial_getheaders`].
-    pub fn note_initial_getheaders_sent(&self) -> u64 {
+    fn header_rounds(&self) -> std::sync::MutexGuard<'_, InitialHeaderRounds> {
+        self.initial_header_rounds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn push_initial_getheaders_id(&self, rounds: &mut InitialHeaderRounds) -> u64 {
         let id = self
             .initial_getheaders_sent
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        self.outstanding_initial_getheaders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(id);
+        rounds.ids.push(id);
         id
+    }
+
+    /// Record one initial `getheaders`. The returned id stays outstanding until
+    /// [`Self::retire_initial_getheaders`]. The count and the id are published
+    /// under one lock.
+    pub fn note_initial_getheaders_sent(&self) -> u64 {
+        let mut rounds = self.header_rounds();
+        self.push_initial_getheaders_id(&mut rounds)
+    }
+
+    /// A follow dial is queued and has not finished its handshake. The wallet
+    /// bind stays down until [`Self::finish_follow_arm`] or
+    /// [`Self::abandon_follow_arm`].
+    pub fn begin_follow_arm(&self) {
+        let mut rounds = self.header_rounds();
+        rounds.pending_arm = rounds.pending_arm.saturating_add(1);
+    }
+
+    /// That dial will not publish a round.
+    pub fn abandon_follow_arm(&self) {
+        let mut rounds = self.header_rounds();
+        rounds.pending_arm = rounds.pending_arm.saturating_sub(1);
+    }
+
+    /// The handshake finished. Publish the round and drop one pending arm.
+    pub fn finish_follow_arm(&self) -> u64 {
+        let mut rounds = self.header_rounds();
+        rounds.pending_arm = rounds.pending_arm.saturating_sub(1);
+        self.push_initial_getheaders_id(&mut rounds)
     }
 
     pub fn initial_getheaders_sent(&self) -> u64 {
@@ -1489,23 +1538,31 @@ impl ChainHub {
         if id == 0 {
             return;
         }
-        let mut open = self
-            .outstanding_initial_getheaders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(at) = open.iter().position(|queued| *queued == id) {
-            open.swap_remove(at);
+        let mut rounds = self.header_rounds();
+        if let Some(at) = rounds.ids.iter().position(|queued| *queued == id) {
+            rounds.ids.swap_remove(at);
         }
     }
 
     /// Initial `getheaders` ids issued after `sent0` that are not applied yet.
     pub fn initial_getheaders_outstanding_after(&self, sent0: u64) -> usize {
-        self.outstanding_initial_getheaders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.header_rounds()
+            .ids
             .iter()
             .filter(|id| **id > sent0)
             .count()
+    }
+
+    /// `(sent since sent0, those ids still open, dials not armed yet)`.
+    /// One lock covers all three, so the sent count cannot move ahead of the ids.
+    pub fn wallet_header_gate(&self, sent0: u64) -> (u64, usize, u64) {
+        let rounds = self.header_rounds();
+        let sent = self
+            .initial_getheaders_sent
+            .load(Ordering::Relaxed)
+            .saturating_sub(sent0);
+        let open = rounds.ids.iter().filter(|id| **id > sent0).count();
+        (sent, open, rounds.pending_arm)
     }
 
     pub fn note_headers_reply(&self) {
