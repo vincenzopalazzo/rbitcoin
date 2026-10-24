@@ -264,6 +264,8 @@ pub struct DialRequest {
     /// `addnode` that runs before the dial task picks it up sees it. `None`
     /// for a feeler, which registers no session and is never counted.
     pub in_flight: Option<DialInFlight>,
+    /// The caller already counted a wallet-history arm for this dial.
+    pub wallet_arm: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -787,6 +789,10 @@ impl LivePeer {
 
     pub fn arm_initial_getheaders(&self, id: u64) {
         self.initial_getheaders_id.store(id, Ordering::Relaxed);
+    }
+
+    pub fn initial_getheaders_armed(&self) -> u64 {
+        self.initial_getheaders_id.load(Ordering::Relaxed)
     }
 
     /// `0` when this session has no outstanding initial `getheaders`.
@@ -2653,7 +2659,7 @@ impl PeerHub {
         if self.is_target_live(&target) {
             return Ok(());
         }
-        self.send_dial(target, PeerConnType::Manual, Some(claim))
+        self.send_dial(target, PeerConnType::Manual, Some(claim), false)
     }
 
     pub fn addnode_net(&self, addr: crate::NetAddr, cmd: &str) -> Result<(), String> {
@@ -3156,14 +3162,34 @@ impl PeerHub {
         self.queue_dial(DialTarget::from_net(addr), typ)
     }
 
+    /// [`Self::dial_net`] for a startup follow whose wallet bind already
+    /// counted this arm.
+    #[doc(hidden)]
+    pub fn dial_net_for_wallet_history(
+        &self,
+        addr: crate::NetAddr,
+        typ: PeerConnType,
+    ) -> Result<(), String> {
+        self.queue_dial_inner(DialTarget::from_net(addr), typ, true)
+    }
+
     /// Queue a dial, counted in flight from now on. A feeler is not counted:
     /// it registers no session, and its probe has no connect deadline, so a
     /// stuck one would block the redial pass for that endpoint.
     #[doc(hidden)]
     pub fn queue_dial(&self, target: DialTarget, typ: PeerConnType) -> Result<(), String> {
+        self.queue_dial_inner(target, typ, false)
+    }
+
+    fn queue_dial_inner(
+        &self,
+        target: DialTarget,
+        typ: PeerConnType,
+        wallet_arm: bool,
+    ) -> Result<(), String> {
         self.trust_allows_target(&target)?;
         let in_flight = (typ != PeerConnType::Feeler).then(|| self.dial_in_flight(&target));
-        self.send_dial(target, typ, in_flight)
+        self.send_dial(target, typ, in_flight, wallet_arm)
     }
 
     /// Queue a dial. The request carries `in_flight` to the dial task; if it
@@ -3174,6 +3200,7 @@ impl PeerHub {
         target: DialTarget,
         typ: PeerConnType,
         in_flight: Option<DialInFlight>,
+        wallet_arm: bool,
     ) -> Result<(), String> {
         self.trust_allows_target(&target)?;
         let g = self.dial_tx.lock().unwrap_or_else(|e| e.into_inner());
@@ -3182,6 +3209,7 @@ impl PeerHub {
             target,
             typ,
             in_flight,
+            wallet_arm,
         })
         .map_err(|_| "dialer closed".to_string())
     }

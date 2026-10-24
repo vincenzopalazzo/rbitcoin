@@ -5209,6 +5209,56 @@ async fn initial_getheaders_retires_only_the_asked_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A follow handshake can publish the round before this session asks.
+/// Starting headers sync keeps that id. A session that will not ask drops
+/// it. One that already asked keeps it until the reply is applied.
+#[tokio::test]
+async fn prearmed_round_follows_headers_sync() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("hdr-prearm");
+    hub.ensure_genesis().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let first = live_peer(&peers, 18530, 51, false);
+    let second = live_peer(&peers, 18531, 52, false);
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let reused = hub.note_initial_getheaders_sent();
+    first.arm_initial_getheaders(reused);
+    assert!(
+        maybe_queue_initial_getheaders(&out_tx, &hub, &first),
+        "the first peer starts headers sync"
+    );
+    assert_eq!(
+        hub.initial_getheaders_sent(),
+        1,
+        "a pre-armed round is not noted again"
+    );
+    assert_eq!(hub.initial_getheaders_outstanding_after(0), 1);
+    assert_eq!(first.initial_getheaders_id.load(Ordering::Relaxed), reused);
+    let _ = out_rx.try_recv();
+    assert!(
+        !maybe_queue_initial_getheaders(&out_tx, &hub, &first),
+        "headers sync already started"
+    );
+    assert_eq!(hub.initial_getheaders_outstanding_after(0), 1);
+    assert_eq!(
+        first.initial_getheaders_id.load(Ordering::Relaxed),
+        reused,
+        "a later ask does not drop the in-flight round"
+    );
+    let declined = hub.note_initial_getheaders_sent();
+    second.arm_initial_getheaders(declined);
+    assert!(
+        !maybe_queue_initial_getheaders(&out_tx, &hub, &second),
+        "an old tip allows one headers peer"
+    );
+    assert_eq!(
+        hub.initial_getheaders_outstanding_after(0),
+        1,
+        "a session that will not send getheaders drops its pre-armed round"
+    );
+    assert_eq!(second.initial_getheaders_id.load(Ordering::Relaxed), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A closed writer fails the getdata. The claim from that attempt is released
 /// so another peer can ask.
 #[tokio::test]

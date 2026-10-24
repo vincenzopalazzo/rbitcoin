@@ -2136,8 +2136,10 @@ pub fn maybe_queue_initial_getheaders(
     session: &crate::peers::LivePeer,
 ) -> bool {
     if session.conn_type == crate::peers::PeerConnType::AddrFetch {
+        release_initial_round(hub, session);
         return false;
     }
+    // A later ping or inv must not drop a round that is already in flight.
     if session.is_sync_started() {
         return false;
     }
@@ -2146,14 +2148,24 @@ pub fn maybe_queue_initial_getheaders(
     let started = session
         .peer_hub()
         .is_some_and(|ph| ph.try_start_headers_sync(session, now, best_t));
-    if started {
-        let h = hub.tip_height().unwrap_or(0);
-        rbitcoin_log::info!("{}", crate::chain::initial_getheaders_log(h, session.id));
+    if !started {
+        // This session will not send the initial getheaders.
+        release_initial_round(hub, session);
+        return false;
+    }
+    let h = hub.tip_height().unwrap_or(0);
+    rbitcoin_log::info!("{}", crate::chain::initial_getheaders_log(h, session.id));
+    // The follow dial may already have published this session's id.
+    if session.initial_getheaders_armed() == 0 {
         let id = hub.note_initial_getheaders_sent();
         session.arm_initial_getheaders(id);
-        let _ = queue_getheaders(out, hub, Some(session), true, None);
     }
-    started
+    let _ = queue_getheaders(out, hub, Some(session), true, None);
+    true
+}
+
+fn release_initial_round(hub: &ChainHub, session: &crate::peers::LivePeer) {
+    hub.retire_initial_getheaders(session.take_initial_getheaders_id());
 }
 
 #[doc(hidden)]

@@ -62,6 +62,7 @@ async fn feeler_does_not_dial_a_discouraged_address() {
             rbitcoin_net::peers::PeerConnType::Feeler,
             rx,
             rbitcoin_net::socks::Dialer::Direct,
+            false,
         ),
     )
     .await;
@@ -133,6 +134,7 @@ async fn proxied_dns_seed_dials_by_name_through_socks() {
             rbitcoin_net::peers::PeerConnType::AddrFetch,
             rx,
             rbitcoin_net::socks::Dialer::socks(proxy, false),
+            false,
         ),
     )
     .await;
@@ -288,6 +290,54 @@ async fn p2p_outbound_only_dials_without_listener() {
     follower.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(linked, "outbound-only follower must handshake the seeder");
+}
+
+/// The wallet bind runs as soon as the follow dial loop returns. The round
+/// has to be outstanding at that moment: on this runtime the spawned session
+/// has not been polled yet, so a later `getheaders` inside the session cannot
+/// be what publishes it.
+#[tokio::test(flavor = "current_thread")]
+async fn follow_from_publishes_the_round_before_it_returns() {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-follow-round-arm-{n}"));
+    std::fs::create_dir_all(dir.join("seed")).unwrap();
+    std::fs::create_dir_all(dir.join("follow")).unwrap();
+    let qa = Query::open_or_create_tiny(dir.join("seed")).unwrap();
+    let qb = Query::open_or_create_tiny(dir.join("follow")).unwrap();
+    let params = ChainParams::regtest();
+    let seeder = P2PNode::start(
+        "127.0.0.1:0".parse().unwrap(),
+        qa,
+        params.clone(),
+        Milestone::NONE,
+        rbitcoin_net::REDIAL_INTERVAL_TEST,
+    )
+    .await
+    .unwrap();
+    let mut follower = P2PNode::start_outbound_only(
+        qb,
+        params,
+        Milestone::NONE,
+        "/rbitcoin:0.1.0(follow)/".into(),
+        0,
+        rbitcoin_net::socks::Dialer::Direct,
+        rbitcoin_net::REDIAL_INTERVAL_TEST,
+    )
+    .await
+    .unwrap();
+    let mark = follower.hub.initial_getheaders_sent();
+    follower.follow_from(seeder.local_addr).await.unwrap();
+    let open = follower.hub.initial_getheaders_outstanding_after(mark);
+    seeder.shutdown().await;
+    follower.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        open >= 1,
+        "the follow round is outstanding when follow_from returns"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

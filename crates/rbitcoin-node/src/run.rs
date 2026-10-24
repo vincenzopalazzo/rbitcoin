@@ -890,7 +890,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let follow_n = targets.len().min(max_out.min(3));
         if catch_up.dial_failed_all() {
             for peer in targets.iter().take(follow_n) {
-                if let Err(e) = node.peers.dial_net(*peer, follow_type) {
+                // Queued dials have not handshaken when the wallet bind
+                // starts. Count the arm now; the dial task publishes the
+                // round or drops the arm.
+                node.hub.begin_follow_arm();
+                if let Err(e) = node.peers.dial_net_for_wallet_history(*peer, follow_type) {
+                    node.hub.abandon_follow_arm();
                     warn!("node: follow dial {peer}: {e}");
                 }
             }

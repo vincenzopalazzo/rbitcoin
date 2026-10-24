@@ -228,6 +228,7 @@ impl P2PNode {
                 let live = dial_live.clone();
                 let d = dialer_task.clone();
                 let (ah_tx, ah_rx) = tokio::sync::oneshot::channel::<tokio::task::AbortHandle>();
+                let wallet_arm = req.wallet_arm;
                 let h = tokio::spawn(async move {
                     let _ = run_outbound_session_with_abort(
                         req.target,
@@ -241,6 +242,7 @@ impl P2PNode {
                         req.typ,
                         ah_rx,
                         d,
+                        wallet_arm,
                     )
                     .await;
                 });
@@ -383,6 +385,10 @@ impl P2PNode {
             self.dialer.clone(),
         )
         .await?;
+        // The wallet bind runs as soon as this dial loop returns. Publish
+        // the round before the spawn so another peer's empty headers cannot
+        // satisfy it while this session has no id yet.
+        arm_outbound_round(&prepared.hub, &prepared.sess, false);
         let handle = tokio::spawn(async move {
             let _ = run_prepared_outbound(prepared).await;
         });
@@ -765,6 +771,8 @@ pub async fn prepare_outbound_session(
 
 pub async fn run_prepared_outbound(prepared: PreparedOutbound) -> Result<(), NetError> {
     let tip_rx = prepared.hub.subscribe_tips();
+    let session = Arc::clone(&prepared.sess);
+    let hub = Arc::clone(&prepared.hub);
     let meta = FollowSessionMeta {
         peer: Some(prepared.peer_hint),
         live: Some(prepared.follow_live),
@@ -779,6 +787,10 @@ pub async fn run_prepared_outbound(prepared: PreparedOutbound) -> Result<(), Net
         meta,
     )
     .await;
+    // The session is done, so it will not apply a reply. Drop an id that
+    // never started or never got its headers. A completed round already
+    // took the id.
+    hub.retire_initial_getheaders(session.take_initial_getheaders_id());
     prepared.peers.unregister(prepared.id);
     out
 }
@@ -796,8 +808,12 @@ pub async fn run_outbound_session_with_abort(
     typ: PeerConnType,
     ah_rx: tokio::sync::oneshot::Receiver<tokio::task::AbortHandle>,
     dialer: crate::socks::Dialer,
+    wallet_arm: bool,
 ) -> Result<(), NetError> {
     if typ == PeerConnType::Feeler {
+        if wallet_arm {
+            hub.abandon_follow_arm();
+        }
         let peer_addr = match peer {
             DialTarget::Socket(addr) => addr,
             DialTarget::Domain { .. } => {
@@ -826,18 +842,47 @@ pub async fn run_outbound_session_with_abort(
         in_flight,
         magic,
         local,
-        hub,
+        Arc::clone(&hub),
         peers,
         user_agent,
         follow_live,
         typ,
         dialer,
     )
-    .await?;
+    .await;
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            if wallet_arm {
+                hub.abandon_follow_arm();
+            }
+            return Err(e);
+        }
+    };
+    // Publish before the session task reaches its first getheaders. A
+    // wallet arm counted at queue time becomes this id.
+    arm_outbound_round(&prepared.hub, &prepared.sess, wallet_arm);
     if let Ok(ah) = ah_rx.await {
         prepared.sess.set_session_abort(ah);
     }
     run_prepared_outbound(prepared).await
+}
+
+/// Put this session's initial getheaders id in the hub before the session
+/// runs. `wallet_arm` also clears the pending count taken at queue time.
+fn arm_outbound_round(hub: &ChainHub, sess: &crate::peers::LivePeer, wallet_arm: bool) {
+    if sess.conn_type == PeerConnType::AddrFetch {
+        if wallet_arm {
+            hub.abandon_follow_arm();
+        }
+        return;
+    }
+    let id = if wallet_arm {
+        hub.finish_follow_arm()
+    } else {
+        hub.note_initial_getheaders_sent()
+    };
+    sess.arm_initial_getheaders(id);
 }
 
 /// Resolve P2P message magic, including BIP325 custom-Signet derivation.
